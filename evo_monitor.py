@@ -1,119 +1,157 @@
-# evo_monitor.py  –  v3  (2025‑07‑19)
+# evo_monitor.py – v4 (2025‑07‑19)
 """
-EVO Fund 日次モニター（GitHub Actions 用）
-------------------------------------------------
-* 12:30 JST に1回だけ起動させる想定（cron: "30 3 * * *"）
-* やること
-    1. EVO Japan Securities のニュースページをスクレイピング
-    2. TDnet 当日インデックスをスクレイピング
-    3. キーワードヒットを Discord Webhook へ即時投稿
-    4. その日のヒットを Markdown にまとめ、GitHub Actions の
-       `steps.digest.outputs.summary` に渡す（workflow 側で
-       daily/ にコミット）
-* 依存:  requests, beautifulsoup4, aiohttp, python-dotenv
-"""
-import asyncio, aiohttp, os, re, time, datetime, html
-from bs4 import BeautifulSoup
+EVO Fund 日次モニター（GitHub Actions 専用）
+================================================
+* 12:30 JST に **1 回だけ** 実行させるワンショット設計。
+* スクリプト自体は 10〜15 秒で終了。ループは一切持たない。
 
-# ------------ 設定 -----------------
+機能一覧
+--------
+1. **EVO Japan Securities ニュースページ**をスクレイピングしてキーワード判定
+2. **TDnet 当日インデックス**をスクレイピングしてキーワード判定
+3. 当日ヒットを Discord Webhook へ即時投稿
+4. 同じヒットを Markdown 形式にまとめ、GitHub Actions 経由で
+   `steps.digest.outputs.summary` に渡す（workflow 側で `/daily/…md` にコミット）
+
+依存ライブラリ
+--------------
+requests / beautifulsoup4 / aiohttp / python-dotenv
+
+環境変数
+--------
+DISCORD_WEBHOOK_URL  … Discord の投稿先 Webhook
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import os
+import sys
+import time
+from typing import List, Tuple
+
+import aiohttp
+from bs4 import BeautifulSoup as BS
+
+# ----------- 定数 -----------------
+WEBHOOK  = os.getenv("DISCORD_WEBHOOK_URL")
+TIMEOUT  = aiohttp.ClientTimeout(total=5)
+HEADERS  = {"User-Agent": "EvoMonitor/4.0 (GitHub Actions)"}
+
 KEYWORDS = [
-    "第三者割当", "新株予約権", "行使", "TIP", "CB", "株式", "ワラント",
-    "EVO", "Evolution", "capital", "fund"
+    "第三者割当",
+    "新株予約権",
+    "行使価額",
+    "MSワラント",
+    "EVO FUND",
+    "Evolution Capital",
 ]
-TDNET_URL  = "https://release.tdnet.info/inbk/{year}/{today}/index.html"
-EVO_NEWS_URL = "https://www.evofinancialgroup.com/ejs/news/"
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
-TIMEOUT_SEC = 5
-HEADERS = {"User-Agent": "EvoMonitor/1.0"}
-# -----------------------------------
 
-def keyword_hit(text: str) -> bool:
-    """英文混入もあるので大文字小文字無視。"""
-    t = text.lower()
-    return any(k.lower() in t for k in KEYWORDS)
+EVO_NEWS   = "https://www.evofinancialgroup.com/ejs/news/"
+TDNET_BASE = "https://release.tdnet.info"
+
+# ---------- 汎用 fetch --------------
 
 async def fetch(session: aiohttp.ClientSession, url: str) -> str | None:
     try:
-        async with session.get(url, timeout=TIMEOUT_SEC) as r:
-            if r.status == 200:
-                return await r.text()
-    except Exception as e:
-        print(f"⚠️  fetch error {url}: {e}")
+        async with session.get(url, timeout=TIMEOUT) as resp:
+            if resp.status == 200:
+                return await resp.text()
+    except Exception as exc:
+        print(f"⚠️  fetch error {url}: {exc}", file=sys.stderr)
     return None
 
-async def parse_evo(session) -> list[dict]:
-    html_text = await fetch(session, EVO_NEWS_URL)
-    hits = []
-    if not html_text:
-        return hits
-    soup = BeautifulSoup(html_text, "html.parser")
-    for a in soup.select(".news__list a"):
-        title = a.get_text(strip=True)
-        if keyword_hit(title):
-            href = a.get("href", "")
-            hits.append({"type": "NEWS", "msg": f"{title} ({href})"})
-    return hits
 
-async def parse_tdnet(session) -> list[dict]:
-    jst = datetime.datetime.now(datetime.timezone.utc).astimezone()
-    today = jst.strftime("%Y%m%d")
-    url = TDNET_URL.format(year=jst.year, today=today)
-    html_text = await fetch(session, url)
-    if not html_text:
+def hit(title: str) -> bool:
+    return any(k in title for k in KEYWORDS)
+
+# ---------- スクレイパ -----------
+
+async def scan_evo(session: aiohttp.ClientSession) -> List[Tuple[str, str]]:
+    html = await fetch(session, EVO_NEWS)
+    if not html:
         return []
-    soup = BeautifulSoup(html_text, "html.parser")
-    hits = []
+    soup = BS(html, "html.parser")
+    items = []
     for a in soup.select("a"):
-        text = a.get_text(" ", strip=True)
-        if keyword_hit(text):
-            href = f"https://release.tdnet.info{a.get('href')}"
-            hits.append({"type": "TDnet", "msg": f"{text} ({href})"})
-    return hits
+        title = a.get_text(strip=True)
+        if hit(title):
+            href = a.get("href") or ""
+            if href and not href.startswith("http"):
+                href = os.path.join(EVO_NEWS, href.lstrip("/"))
+            items.append((title, href))
+    return items
 
-async def send_discord(session, content: str):
-    if not DISCORD_WEBHOOK:
+
+async def scan_tdnet(session: aiohttp.ClientSession) -> List[Tuple[str, str]]:
+    jst = dt.datetime.utcnow() + dt.timedelta(hours=9)
+    url = f"{TDNET_BASE}/inbk/{jst:%Y}/{jst:%Y%m%d}/index.html"
+    html = await fetch(session, url)
+    if not html:
+        return []
+    soup = BS(html, "html.parser")
+    items = []
+    for a in soup.select("a"):
+        title = a.get_text(strip=True)
+        if hit(title):
+            href = a.get("href") or ""
+            if href.startswith("./"):
+                href = f"{TDNET_BASE}{href[1:]}"
+            items.append((title, href))
+    return items
+
+# ---------- Discord 投稿 -----------
+
+async def discord_send(content: str) -> None:
+    if not WEBHOOK:
+        print("⚠️  DISCORD_WEBHOOK_URL not set – skipping Discord", file=sys.stderr)
         return
-    try:
-        await session.post(DISCORD_WEBHOOK, json={"content": content}, timeout=TIMEOUT_SEC)
-    except Exception as e:
-        print(f"⚠️  discord post error: {e}")
+    async with aiohttp.ClientSession() as s:
+        await s.post(WEBHOOK, json={"content": content[:1900]})
+
+# ---------- Digest 生成 ------------
 
 def build_digest(hits: list[dict]) -> str:
     if not hits:
         return ""
-    today = datetime.date.today().isoformat()
-    lines: list[str] = [f"# EVO DAILY DIGEST - {today}", ""]
-    section = {"TDnet": [], "NEWS": []}
-    for h in hits:
-        section[h["type"]].append(h["msg"])
-    if section["TDnet"]:
+    lines: list[str] = ["# EVO DAILY DIGEST - " + time.strftime("%Y-%m-%d"), ""]
+    tdnet = [h for h in hits if h["type"] == "TDnet"]
+    news  = [h for h in hits if h["type"] == "NEWS"]
+    if tdnet:
         lines.append("## TDnet ヒット")
-        lines += [f"- {m}" for m in section["TDnet"]]
+        for h in tdnet:
+            lines.append(f"- {h['msg']}")
         lines.append("")
-    if section["NEWS"]:
+    if news:
         lines.append("## EVO 公式ニュース")
-        lines += [f"- {m}" for m in section["NEWS"]]
+        for h in news:
+            lines.append(f"- {h['msg']}")
         lines.append("")
-    lines.append("---")
-    lines.append("**本日のまとめ**  \n- TDnet: {} 件  \n- NEWS: {} 件".format(
-        len(section["TDnet"]), len(section["NEWS"]))
-    )
+    lines.append("---\n**本日のまとめ**  \n- 新規ディール: "
+                 f"{len(tdnet)} 件  \n- 公式ニュース: {len(news)} 件")
     return "\n".join(lines)
 
-async def main():
+# ---------- メイン ---------------
+
+async def main() -> None:
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-        tdnet_hits, news_hits = await asyncio.gather(
-            parse_tdnet(session), parse_evo(session)
-        )
-        all_hits = tdnet_hits + news_hits
-        # Discord 投稿
-        for h in all_hits:
-            await send_discord(session, f"[{h['type']}] {h['msg']}")
-        # Digest 作成
-        digest = build_digest(all_hits)
-        if digest:
-            escaped = digest.replace('%', '%25').replace('\n', '%0A')
-            print(f"::set-output name=summary::{escaped}")
+        evo, tdnet = await asyncio.gather(scan_evo(session), scan_tdnet(session))
+
+    # Discord へ即時送信用文字列（2k 文字制限対応）
+    instant_hits = [*(f"[EVO NEWS] {t}\n{u}" for t, u in evo),
+                    *(f"[TDNET] {t}\n{u}"    for t, u in tdnet)]
+    if instant_hits:
+        await discord_send("\n\n".join(instant_hits))
+
+    # Digest 用に dict へ整形
+    all_hits = (
+        [{"type": "NEWS",  "msg": f"{t}\n{u}"}  for t, u in evo] +
+        [{"type": "TDnet", "msg": f"{t}\n{u}"}  for t, u in tdnet]
+    )
+    digest = build_digest(all_hits)
+    if digest:
+        print("::set-output name=summary::" +
+              digest.replace('%', '%25').replace('\n', '%0A'))
 
 if __name__ == "__main__":
     asyncio.run(main())
