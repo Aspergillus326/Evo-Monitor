@@ -1,4 +1,3 @@
-```python
 """evo_monitor.py  –  v2 (2025‑07‑19)
 One‑shot scanner for EVO関連ニュース & TDnet PDF hits.
 Designed to be executed once by GitHub Actions (or cron) and exit within
@@ -106,7 +105,6 @@ async def main() -> None:
             await discord_send("\n\n".join(hits))
         else:
             print("No matches today – OK")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
