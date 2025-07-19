@@ -108,3 +108,29 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+# ==== ここから追記 ====
+def build_digest(hits):
+    """hits = [{'type': 'TDnet', 'msg': '…'}, …] を受け取り Markdown 文字列を返す"""
+    if not hits:
+        return ""  # 0件なら空文字（あとでスキップ）
+    lines = ["# EVO DAILY DIGEST - " + time.strftime("%Y-%m-%d"), ""]
+    tdnet = [h for h in hits if h["type"] == "TDnet"]
+    news  = [h for h in hits if h["type"] == "NEWS"]
+    if tdnet:
+        lines.append("## TDnet ヒット")
+        for h in tdnet:
+            lines.append(f"- {h['msg']}")
+        lines.append("")
+    if news:
+        lines.append("## EVO 公式ニュース")
+        for h in news:
+            lines.append(f"- {h['msg']}")
+        lines.append("")
+    lines.append("---\n**本日のまとめ**  \n- 新規ディール: "
+                 f"{len(tdnet)} 件  \n- 公式ニュース: {len(news)} 件")
+    return "\n".join(lines)
+
+# メイン処理の最後付近で…
+digest = build_digest(all_hits)       # all_hits は既に作ってあるリストを想定
+print("::set-output name=summary::" + digest.replace("%", "%25").replace("\n", "%0A"))
+# ↑ GitHub Actions で steps.digest.outputs.summary として受け取れる
