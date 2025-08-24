@@ -1,5 +1,0 @@
-requests
-beautifulsoup4
-schedule
-python-dotenv
-aiohttp
